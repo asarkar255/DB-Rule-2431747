@@ -4,7 +4,7 @@ from typing import List, Optional, Any, Dict, Tuple
 import re
 
 app = FastAPI(
-    title="ABAP DB Operation Remediator for S/4HANA Obsolete FI/CO Tables (Note 2431747) — full-block rewrite"
+    title="ABAP DB Operation Remediator for S/4HANA Obsolete FI/CO Tables (Note 2431747) — full-file + snippets"
 )
 
 # -------------------------
@@ -31,24 +31,48 @@ NO_VIEW_TABLES = {"FAGLFLEXA", "FAGLFLEXT"}
 OBSOLETE_TABLES = set(TABLE_MAPPING.keys()) | set(NO_VIEW_TABLES)
 
 # -------------------------
-# Regex
+# Regexes
 # -------------------------
-# Match any complete SELECT ... .
+# Safer FROM/JOIN table capture: only capture an alias if the token is NOT a keyword like INTO/WHERE/JOIN/etc.
+RESERVED_FOLLOWERS = r"(?:INTO|WHERE|INNER|LEFT|RIGHT|FULL|CROSS|JOIN|ORDER|GROUP|HAVING|FOR|ON|BY|UNION|UP|WITH)\b"
+
+FROM_TBL_RE = re.compile(
+    rf"""\bFROM\s+
+        (?P<table>\w+)
+        (?P<after>
+            \s+(?:AS\s+)?       # optional 'AS '
+            (?!{RESERVED_FOLLOWERS})
+            (?P<alias>\w+)      # alias token (only if not a reserved word)
+        )?
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+JOIN_TBL_RE = re.compile(
+    rf"""\bJOIN\s+
+        (?P<table>\w+)
+        (?P<after>
+            \s+(?:AS\s+)?       # optional 'AS '
+            (?!{RESERVED_FOLLOWERS})
+            (?P<alias>\w+)      # alias token (only if not a reserved word)
+        )?
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+# Match any full SELECT statement up to a period.
 SELECT_BLOCK_RE = re.compile(r"(?P<full>SELECT[\s\S]*?\.)", re.IGNORECASE)
 
-# UPDATE, DELETE FROM, INSERT, MODIFY (statement-terminated)
-UPDATE_RE = re.compile(r"(?P<full>UPDATE\s+\w+[\s\S]*?\.)", re.IGNORECASE)
-DELETE_RE = re.compile(r"(?P<full>DELETE\s+FROM\s+\w+[\s\S]*?\.)", re.IGNORECASE)
-INSERT_RE = re.compile(r"(?P<full>INSERT\s+\w+[\s\S]*?\.)", re.IGNORECASE)
-MODIFY_RE = re.compile(r"(?P<full>MODIFY\s+\w+[\s\S]*?\.)", re.IGNORECASE)
+# Other DML
+UPDATE_RE = re.compile(r"(UPDATE\s+\w+[\s\S]*?\.)", re.IGNORECASE)
+DELETE_RE = re.compile(r"(DELETE\s+FROM\s+\w+[\s\S]*?\.)", re.IGNORECASE)
+INSERT_RE = re.compile(r"(INSERT\s+\w+[\s\S]*?\.)", re.IGNORECASE)
+MODIFY_RE = re.compile(r"(MODIFY\s+\w+[\s\S]*?\.)", re.IGNORECASE)
 
-# FROM / JOIN table capture:  FROM <tab> [AS alias]    JOIN <tab> [AS alias]
-FROM_TBL_RE = re.compile(r"\bFROM\s+(?P<table>\w+)(?P<after>\s+(?:AS\s+)?\w+)?", re.IGNORECASE)
-JOIN_TBL_RE = re.compile(r"\bJOIN\s+(?P<table>\w+)(?P<after>\s+(?:AS\s+)?\w+)?", re.IGNORECASE)
-
-# Any obsolete table literal
+# Literal obsolete table names anywhere
 LITERAL_TABLES_RE = re.compile(
-    r"\b(" + "|".join(re.escape(t) for t in OBSOLETE_TABLES) + r")\b", re.IGNORECASE
+    r"\b(" + "|".join(re.escape(t) for t in OBSOLETE_TABLES) + r")\b",
+    re.IGNORECASE
 )
 
 # -------------------------
@@ -66,10 +90,8 @@ class Finding(BaseModel):
     severity: Optional[str] = None
     line: Optional[int] = None
     message: Optional[str] = None
-    suggestion: Optional[str] = None
-    snippet: Optional[str] = None
-    original_block: Optional[str] = None
-    remediated_block: Optional[str] = None
+    suggestion: Optional[str] = None   # remediated snippet
+    snippet: Optional[str] = None      # original full statement
     meta: Optional[Dict[str, Any]] = None
 
 class Unit(BaseModel):
@@ -83,7 +105,7 @@ class Unit(BaseModel):
     code: Optional[str] = ""
 
 # -------------------------
-# Utils
+# Helpers
 # -------------------------
 def line_of_offset(text: str, off: int) -> int:
     return text.count("\n", 0, off) + 1
@@ -92,7 +114,7 @@ def get_replacement_table(table: str) -> str:
     t_up = (table or "").upper()
     if t_up in NO_VIEW_TABLES:
         return "ACDOCA"
-    if t_up in TABLE_MAPPING:
+    elif t_up in TABLE_MAPPING:
         return TABLE_MAPPING[t_up]["source"].split("/")[0]
     return table
 
@@ -102,227 +124,182 @@ def remediation_comment(table: str, stmt_type: str) -> str:
         return "/* NOTE: Compatibility view cannot be used for write operations in S/4HANA. Use ACDOCA or source table directly. */"
     if t_up in NO_VIEW_TABLES:
         return f"/* NOTE: {t_up} is obsolete in S/4HANA. Use ACDOCA directly and map fields accordingly. */"
-    if t_up in TABLE_MAPPING:
+    elif t_up in TABLE_MAPPING:
         src = TABLE_MAPPING[t_up]["source"]
         return f"/* NOTE: {t_up} is obsolete in S/4HANA. Adapt to ACDOCA or compatibility view (source: {src}). */"
     return ""
 
-def inject_inline_comment(token_text: str, table: str, stmt_type: str) -> str:
-    # Append a brief comment right after the table (keeps aliases intact)
+def inject_inline_comment(after_table_token: str, table: str, stmt_type: str) -> str:
+    """
+    Put the note right after the table(+alias) token, before any next keyword.
+    """
     comment = remediation_comment(table, stmt_type)
-    return (token_text + (" " + comment if comment else ""))
+    return after_table_token + (f" {comment}" if comment else "")
 
 def replace_from_join_tables(block: str, stmt_type: str) -> Tuple[str, List[Dict[str, str]]]:
     """
-    Replace obsolete tables in FROM and JOIN positions and inject short comments.
-    Returns (new_block, changes_list)
-    changes_list: [{"orig": "BSEG", "repl": "ACDOCA", "pos": <index>, "context": "FROM/JOIN"}]
+    Replace obsolete tables in FROM/JOIN within the given SELECT block.
+    Preserve alias and position comments safely after the table/alias token.
     """
     changes: List[Dict[str, str]] = []
-    out = block
-    offset_shift = 0  # in case we later need positional details
 
-    def _repl_func(m: re.Match, context: str) -> str:
+    def _repl_func(m: re.Match, kw: str) -> str:
         table = m.group("table")
         after = m.group("after") or ""
-        t_up = table.upper()
+        t_up = (table or "").upper()
         if t_up in OBSOLETE_TABLES:
-            repl = get_replacement_table(table)
-            token = f"{repl}{after}"
-            token_with_cmt = inject_inline_comment(token, table, "SELECT")
-            changes.append({"orig": t_up, "repl": repl, "context": context})
-            return f"{context} {token_with_cmt}"
-        # no change
+            repl_tbl = get_replacement_table(table)
+            token = f"{repl_tbl}{after}"
+            token = inject_inline_comment(token, table, "SELECT")
+            changes.append({"orig": t_up, "repl": repl_tbl, "context": kw})
+            return f"{kw} {token}"
         return m.group(0)
 
-    # Replace FROM table
-    out = FROM_TBL_RE.sub(lambda mm: _repl_func(mm, "FROM"), out, count=1)  # only the first FROM
-
-    # Replace all JOIN tables
+    # Replace first FROM occurrence
+    out = FROM_TBL_RE.sub(lambda mm: _repl_func(mm, "FROM"), block, count=1)
+    # Replace all JOIN occurrences
     out = JOIN_TBL_RE.sub(lambda mm: _repl_func(mm, "JOIN"), out)
-
     return out, changes
 
-def remediate_select_block(block: str) -> Tuple[str, List[Dict[str, str]]]:
+def remediate_select_block(block: str) -> Tuple[str, bool, List[Dict[str, str]]]:
     """
-    Produce a fully remediated SELECT block by replacing obsolete tables in FROM/JOIN.
+    Returns (new_block, changed?, changes_list)
     """
+    contains_obsolete = bool(LITERAL_TABLES_RE.search(block))
+    if not contains_obsolete:
+        return block, False, []
     new_block, changes = replace_from_join_tables(block, "SELECT")
-    return new_block, changes
+    changed = (new_block != block)
+    return new_block, changed, changes
 
-def remediate_other_block(stmt_text: str, stmt_type: str) -> Tuple[str, Optional[str]]:
+def remediate_other_stmt(stmt: str, stmt_type: str) -> Tuple[str, bool, Dict[str, str]]:
     """
-    Rewrite UPDATE/DELETE/INSERT/MODIFY for obsolete table and return (new_stmt, table_if_changed).
+    For UPDATE/DELETE/INSERT/MODIFY statements, replace the target table if obsolete.
     """
-    # Extract table following verb (for DELETE might be "DELETE FROM <table>")
-    if stmt_type.upper() == "DELETE":
-        m = re.search(r"\bDELETE\s+FROM\s+(\w+)", stmt_text, re.IGNORECASE)
+    # Get the table token
+    if stmt_type == "DELETE":
+        table_match = re.search(r"DELETE\s+FROM\s+(\w+)", stmt, re.IGNORECASE)
+    elif stmt_type == "SELECT":
+        table_match = re.search(r"FROM\s+(\w+)", stmt, re.IGNORECASE)
     else:
-        m = re.search(rf"\b{stmt_type}\s+(\w+)", stmt_text, re.IGNORECASE)
-    if not m:
-        return stmt_text, None
+        table_match = re.search(rf"{stmt_type}\s+(\w+)", stmt, re.IGNORECASE)
+    if not table_match:
+        return stmt, False, {}
 
-    table = m.group(1)
+    table = table_match.group(1)
     t_up = table.upper()
     if t_up not in OBSOLETE_TABLES:
-        return stmt_text, None
+        return stmt, False, {}
 
     repl = get_replacement_table(table)
-    comment = remediation_comment(table, stmt_type.upper())
-    if stmt_type.upper() == "DELETE":
-        new = re.sub(rf"\bDELETE\s+FROM\s+{re.escape(table)}\b",
-                     f"DELETE FROM {repl} {comment}", stmt_text, flags=re.IGNORECASE)
+    note = remediation_comment(table, stmt_type)
+    if stmt_type in ("DELETE", "SELECT"):
+        new_stmt = re.sub(rf"({stmt_type}\s+FROM\s+){re.escape(table)}\b",
+                          rf"\1{repl}" + (f" {note}" if note else ""),
+                          stmt, flags=re.IGNORECASE)
     else:
-        new = re.sub(rf"\b{stmt_type}\s+{re.escape(table)}\b",
-                     f"{stmt_type} {repl} {comment}", stmt_text, flags=re.IGNORECASE)
-    return new, t_up
-
-def snippet_at(text: str, start: int, end: int) -> str:
-    # Keep previous behavior for quick context; now we also add original_block separately
-    s = max(0, start - 60)
-    e = min(len(text), end + 60)
-    return text[s:e].replace("\n", "\\n")
+        new_stmt = re.sub(rf"({stmt_type}\s+){re.escape(table)}\b",
+                          rf"\1{repl}" + (f" {note}" if note else ""),
+                          stmt, flags=re.IGNORECASE)
+    return new_stmt, (new_stmt != stmt), {"orig": t_up, "repl": repl, "context": stmt_type}
 
 def apply_span_replacements(source: str, repls: List[Tuple[Tuple[int, int], str]]) -> str:
     """
-    Apply non-overlapping replacements from the end towards the start.
-    repls: [((start, end), replacement_text), ...]
+    Apply multiple (start,end)->replacement edits safely (right-to-left).
     """
     out = source
-    for (s, e), rep in sorted(repls, key=lambda x: x[0][0], reverse=True):
-        out = out[:s] + rep + out[e:]
+    for (s, e), r in sorted(repls, key=lambda x: x[0][0], reverse=True):
+        out = out[:s] + r + out[e:]
     return out
 
+def pack_issue(unit: Unit, issue_type: str, message: str, severity: str,
+               start: int, end: int, suggestion: str, snippet: str, meta: dict = None) -> Dict[str, Any]:
+    src = unit.code or ""
+    return {
+        "pgm_name": unit.pgm_name,
+        "inc_name": unit.inc_name,
+        "type": unit.type,
+        "name": unit.name,
+        "class_implementation": unit.class_implementation,
+        "start_line": unit.start_line,
+        "end_line": unit.end_line,
+        "issue_type": issue_type,
+        "severity": severity,
+        "line": line_of_offset(src, start),
+        "message": message,
+        "suggestion": suggestion,  # remediated snippet
+        "snippet": snippet,        # full original statement
+        "meta": meta or {}
+    }
+
 # -------------------------
-# Main scan logic (unit)
+# Main scan logic (single unit)
 # -------------------------
 def scan_unit(unit: Unit) -> dict:
     findings: List[Dict[str, Any]] = []
-    replacements: List[Tuple[Tuple[int, int], str]] = []
     src = unit.code or ""
+    repls: List[Tuple[Tuple[int, int], str]] = []
 
-    # A) Handle ALL SELECT blocks (single or multiple tables)
+    # 1) Full SELECT statements
     for m in SELECT_BLOCK_RE.finditer(src):
-        full = m.group("full")
-        start, end = m.span("full")
+        full_stmt = m.group("full")
+        new_stmt, changed, changes = remediate_select_block(full_stmt)
+        if changed:
+            # Suggestion: remediated snippet; Snippet: full original statement
+            msg = "SELECT uses obsolete FI/CO table(s) — redirected to ACDOCA/compatibility view."
+            sev = "warning"
+            meta = {"changes": changes}
+            findings.append(
+                pack_issue(unit, "ObsoleteTableSelect", msg, sev, m.start(), m.end(), new_stmt, full_stmt, meta)
+            )
+            repls.append(((m.start(), m.end()), new_stmt))
 
-        # Check if the block mentions any obsolete table in FROM/JOIN positions
-        contains_obsolete = False
-        # Light check: look for any obsolete token; deeper check is done in remediate_select_block
-        if LITERAL_TABLES_RE.search(full):
-            # Attempt remediation
-            new_block, changes = remediate_select_block(full)
-            contains_obsolete = bool(changes)
-
-            if contains_obsolete:
-                msg = "SELECT uses obsolete FI/CO table(s) in FROM/JOIN."
-                sev = "warning"
-                # Build suggestion = full remediated block
-                suggestion = new_block
-                findings.append({
-                    "pgm_name": unit.pgm_name,
-                    "inc_name": unit.inc_name,
-                    "type": unit.type,
-                    "name": unit.name,
-                    "class_implementation": unit.class_implementation,
-                    "start_line": line_of_offset(src, start),
-                    "end_line": line_of_offset(src, end),
-                    "issue_type": "ObsoleteTableSelect",
-                    "severity": sev,
-                    "line": line_of_offset(src, start),
-                    "message": msg,
-                    "suggestion": suggestion,
-                    "snippet": snippet_at(src, start, end),
-                    "original_block": full,
-                    "remediated_block": new_block,
-                    "meta": {
-                        "changes": changes
-                    }
-                })
-                # Queue replacement for whole-file remediated_code
-                replacements.append(((start, end), new_block))
-
-    # B) UPDATE / DELETE / INSERT / MODIFY statements
+    # 2) UPDATE/DELETE/INSERT/MODIFY single statements
     for stmt_type, pattern in [
         ("UPDATE", UPDATE_RE),
         ("DELETE", DELETE_RE),
         ("INSERT", INSERT_RE),
         ("MODIFY", MODIFY_RE),
     ]:
-        for m in pattern.finditer(src):
-            full = m.group("full").strip()
-            start, end = m.span("full")
+        for mx in pattern.finditer(src):
+            stmt_text = mx.group(1)
+            new_stmt, changed, change_meta = remediate_other_stmt(stmt_text, stmt_type)
+            if changed:
+                msg = f"{stmt_type} uses obsolete FI/CO table — not allowed on compatibility views; adjust to ACDOCA."
+                sev = "error"  # writes are critical
+                findings.append(
+                    pack_issue(unit, f"ObsoleteTable{stmt_type.title()}", msg, sev, mx.start(1), mx.end(1), new_stmt, stmt_text, change_meta)
+                )
+                repls.append(((mx.start(1), mx.end(1)), new_stmt))
 
-            new_stmt, changed_table = remediate_other_block(full, stmt_type)
-            if changed_table:
-                msg = f"{stmt_type} on obsolete table/view {changed_table}."
-                sev = "error"  # write ops are not allowed on compatibility views
-                findings.append({
-                    "pgm_name": unit.pgm_name,
-                    "inc_name": unit.inc_name,
-                    "type": unit.type,
-                    "name": unit.name,
-                    "class_implementation": unit.class_implementation,
-                    "start_line": line_of_offset(src, start),
-                    "end_line": line_of_offset(src, end),
-                    "issue_type": f"ObsoleteTable{stmt_type.title()}",
-                    "severity": sev,
-                    "line": line_of_offset(src, start),
-                    "message": msg,
-                    "suggestion": new_stmt,
-                    "snippet": snippet_at(src, start, end),
-                    "original_block": full,
-                    "remediated_block": new_stmt,
-                    "meta": {
-                        "orig_table": changed_table,
-                        "replacement_table": get_replacement_table(changed_table),
-                        "context": "WRITE_OP"
-                    }
-                })
-                replacements.append(((start, end), new_stmt))
-
-    # C) Literal mentions (informational). Keep as-is; do not replace in code automatically.
-    #    (We still emit a finding so callers can triage.)
-    for m in LITERAL_TABLES_RE.finditer(src):
-        table = m.group(1)
+    # 3) Literal table mentions anywhere (info)
+    # (We report but do not auto-replace these, since context could be non-SQL.)
+    for ml in LITERAL_TABLES_RE.finditer(src):
+        table = ml.group(1)
         t_up = table.upper()
-        start, end = m.span(1)
-        # Skip if this region is already covered by a SELECT/WRITE replacement
-        covered = any(s <= start and end <= e for (s, e), _ in replacements)
-        if covered:
-            continue
+        # If this literal lies inside an already-replaced span, skip double reporting
+        findings.append(
+            pack_issue(
+                unit,
+                "ObsoleteTableLiteral",
+                f"Obsolete table/view {t_up} used as a literal.",
+                "info",
+                ml.start(),
+                ml.end(),
+                f"Replace literal '{table}' with '{get_replacement_table(table)}' where applicable.",
+                src[max(0, ml.start()-60):min(len(src), ml.end()+60)]
+            )
+        )
 
-        suggestion = f"Replace literal '{table}' with '{get_replacement_table(table)}' where applicable."
-        findings.append({
-            "pgm_name": unit.pgm_name,
-            "inc_name": unit.inc_name,
-            "type": unit.type,
-            "name": unit.name,
-            "class_implementation": unit.class_implementation,
-            "start_line": line_of_offset(src, start),
-            "end_line": line_of_offset(src, end),
-            "issue_type": "ObsoleteTableLiteral",
-            "severity": "info",
-            "line": line_of_offset(src, start),
-            "message": f"Obsolete table/view {t_up} used as a literal.",
-            "suggestion": suggestion,
-            "snippet": snippet_at(src, start, end),
-            "original_block": table,
-            "remediated_block": get_replacement_table(table),
-            "meta": {
-                "orig_table": t_up,
-                "replacement_table": get_replacement_table(table),
-                "context": "literal"
-            }
-        })
+    remediated_code = apply_span_replacements(src, repls)
 
     res = unit.model_dump()
+    res["original_code"] = src
+    res["remediated_code"] = remediated_code
     res["findings"] = findings
-    # Build whole-file remediated code
-    res["remediated_code"] = apply_span_replacements(src, replacements) if replacements else src
     return res
 
-def analyze_units(units: List[Unit]) -> List[Dict]:
+def analyze_units(units: List[Unit]) -> List[Dict[str, Any]]:
     return [scan_unit(u) for u in units]
 
 # -------------------------
@@ -330,11 +307,6 @@ def analyze_units(units: List[Unit]) -> List[Dict]:
 # -------------------------
 @app.post("/remediate-array")
 async def remediate_array(units: List[Unit]):
-    """
-    Returns, per unit:
-      - findings[] with original_block and remediated_block for each issue
-      - remediated_code (source with all SELECT/WRITE statements rewritten)
-    """
     return analyze_units(units)
 
 @app.get("/health")
